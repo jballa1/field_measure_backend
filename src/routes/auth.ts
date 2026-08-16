@@ -1,154 +1,155 @@
 import { FastifyInstance } from 'fastify';
 import { db } from '../db/index.js';
 import { users } from '../db/schema.js';
-import { eq } from 'drizzle-orm';
-
-const AUTH_KEY = process.env.MSG91_AUTH_KEY!;
-const TEMPLATE_ID = process.env.MSG91_OTP_TEMPLATE_ID!;
-
-// In-memory OTP store
-const otpStore = new Map<string, { otp: string; expiresAt: number }>();
-
-function generateOtp(): string {
-    return Math.floor(100000 + Math.random() * 900000).toString();
-}
-
-function formatPhone(phone: string): string {
-    let formatted = phone.replace(/^\+/, '').replace(/[\s-]/g, '');
-    if (formatted.length === 10 && /^[6-9]\d{9}$/.test(formatted)) {
-        formatted = '91' + formatted;
-    }
-    return formatted;
-}
-
-async function sendOtpSms(phone: string, otp: string): Promise<boolean> {
-    const formattedPhone = formatPhone(phone);
-    const requestBody = {
-        template_id: TEMPLATE_ID,
-        short_url: '0',
-        recipients: [{ mobiles: formattedPhone, var: otp }],
-    };
-    console.log('[MSG91] Sending OTP:', { phone: formattedPhone, otp });
-    const res = await fetch('https://control.msg91.com/api/v5/flow/', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'authkey': AUTH_KEY },
-        body: JSON.stringify(requestBody),
-    });
-    const data = await res.json() as any;
-    console.log('[MSG91] Response:', JSON.stringify(data));
-    return res.ok && data.type === 'success';
-}
+import { eq, or } from 'drizzle-orm';
+import bcrypt from 'bcryptjs';
 
 export default async function authRoutes(fastify: FastifyInstance) {
 
-    // POST /api/auth/send-otp
-    // mode: 'register' | 'login'
-    fastify.post('/send-otp', async (request, reply) => {
-        const { phone, mode } = request.body as { phone: string; mode: 'register' | 'login' };
+  // POST /api/auth/register
+  fastify.post('/register', async (request, reply) => {
+    const { firstName, lastName, username, password } =
+      request.body as {
+        firstName: string;
+        lastName: string;
+        username: string;
+        password: string;
+      };
 
-        if (!phone || phone.length !== 10) {
-            return reply.status(400).send({ error: 'Enter a valid 10-digit phone number.' });
-        }
+    // Validations
+    if (!firstName?.trim())
+      return reply.status(400).send({ error: 'First name is required.' });
+    if (!lastName?.trim())
+      return reply.status(400).send({ error: 'Last name is required.' });
+    if (!username?.trim())
+      return reply.status(400).send({ error: 'Username is required.' });
+    if (!/^[a-z0-9_]{3,20}$/.test(username.toLowerCase()))
+      return reply.status(400).send({
+        error: 'Username must be 3-20 characters — letters, numbers, underscore only.',
+      });
+    if (!password || password.length < 6)
+      return reply.status(400).send({
+        error: 'Password must be at least 6 characters.',
+      });
 
-        // Check if user exists
-        const [existingUser] = await db.select().from(users).where(eq(users.phone, phone)).limit(1);
+    // Check username taken
+    const [existing] = await db
+      .select()
+      .from(users)
+      .where(eq(users.username, username.toLowerCase()))
+      .limit(1);
 
-        if (mode === 'login' && !existingUser) {
-            return reply.status(404).send({ error: 'No account found with this number. Please register first.' });
-        }
+    if (existing)
+      return reply.status(409).send({ error: 'Username already taken. Choose another.' });
 
-        if (mode === 'register' && existingUser) {
-            return reply.status(409).send({ error: 'This number is already registered. Please sign in instead.' });
-        }
+    const passwordHash = await bcrypt.hash(password, 10);
 
-        const otp = generateOtp();
-        otpStore.set(phone, { otp, expiresAt: Date.now() + 10 * 60 * 1000 });
+    const [user] = await db
+      .insert(users)
+      .values({
+        firstName: firstName.trim(),
+        lastName: lastName.trim(),
+        username: username.toLowerCase(),
+        passwordHash,
+      })
+      .returning();
 
-        const ok = await sendOtpSms(phone, otp);
-        if (!ok) {
-            otpStore.delete(phone);
-            return reply.status(500).send({ error: 'Failed to send OTP. Try again.' });
-        }
+    const token = fastify.jwt.sign(
+      { id: user.id, firstName: user.firstName, lastName: user.lastName, username: user.username, plan: user.plan },
+      { expiresIn: '30d' }
+    );
 
-        console.log(`[OTP] ${phone}: ${otp}`);
-        return reply.send({ message: 'OTP sent successfully.' });
+    return reply.send({
+      token,
+      firstName: user.firstName,
+      lastName: user.lastName,
+      username: user.username,
+      plan: user.plan,
     });
+  });
 
-    // POST /api/auth/verify-otp
-    fastify.post('/verify-otp', async (request, reply) => {
-        const { phone, otp, name } = request.body as { phone: string; otp: string; name?: string };
+  // POST /api/auth/login
+  fastify.post('/login', async (request, reply) => {
+    const { username, password } = request.body as {
+      username: string;
+      password: string;
+    };
 
-        if (!phone || !otp) {
-            return reply.status(400).send({ error: 'Phone and OTP are required.' });
-        }
+    if (!username?.trim())
+      return reply.status(400).send({ error: 'Username is required.' });
+    if (!password)
+      return reply.status(400).send({ error: 'Password is required.' });
 
-        const stored = otpStore.get(phone);
-        if (!stored) {
-            return reply.status(400).send({ error: 'OTP not found. Please request a new one.' });
-        }
-        if (Date.now() > stored.expiresAt) {
-            otpStore.delete(phone);
-            return reply.status(400).send({ error: 'OTP expired. Please request a new one.' });
-        }
-        if (stored.otp !== otp) {
-            return reply.status(400).send({ error: 'Invalid OTP. Please try again.' });
-        }
+    const [user] = await db
+      .select()
+      .from(users)
+      .where(eq(users.username, username.toLowerCase()))
+      .limit(1);
 
-        otpStore.delete(phone);
+    if (!user || !(await bcrypt.compare(password, user.passwordHash)))
+      return reply.status(401).send({ error: 'Invalid username or password.' });
 
-        let [user] = await db.select().from(users).where(eq(users.phone, phone)).limit(1);
+    const token = fastify.jwt.sign(
+      { id: user.id, firstName: user.firstName, lastName: user.lastName, username: user.username, plan: user.plan },
+      { expiresIn: '30d' }
+    );
 
-        if (!user) {
-            // New user — save with name
-            [user] = await db.insert(users)
-                .values({ phone, name: name?.trim() || '' })
-                .returning();
-        }
-
-        const token = fastify.jwt.sign(
-            { id: user.id, name: user.name, phone: user.phone, plan: user.plan },
-            { expiresIn: '30d' }
-        );
-
-        return reply.send({
-            token,
-            name: user.name,
-            phone: user.phone,
-            plan: user.plan,
-            isNewUser: !user.name,
-        });
+    return reply.send({
+      token,
+      firstName: user.firstName,
+      lastName: user.lastName,
+      username: user.username,
+      plan: user.plan,
     });
+  });
 
-    // PATCH /api/auth/update-name
-    fastify.patch('/update-name', { preHandler: [fastify.authenticate] }, async (request, reply) => {
-        const { id } = request.user as any;
-        const { name } = request.body as { name: string };
-        if (!name?.trim()) return reply.status(400).send({ error: 'Name is required.' });
-        const [user] = await db.update(users).set({ name: name.trim() }).where(eq(users.id, id)).returning();
-        return reply.send({ name: user.name });
+  // GET /api/auth/me
+  fastify.get('/me', { preHandler: [fastify.authenticate] }, async (request, reply) => {
+    const { id } = request.user as any;
+    const [user] = await db.select().from(users).where(eq(users.id, id)).limit(1);
+    if (!user) return reply.status(404).send({ error: 'User not found.' });
+    return reply.send({
+      firstName: user.firstName,
+      lastName: user.lastName,
+      username: user.username,
+      plan: user.plan,
     });
+  });
 
-    // GET /api/auth/me
-    fastify.get('/me', { preHandler: [fastify.authenticate] }, async (request, reply) => {
-        const { id } = request.user as any;
-        const [user] = await db.select().from(users).where(eq(users.id, id)).limit(1);
-        if (!user) return reply.status(404).send({ error: 'User not found.' });
-        return reply.send({ name: user.name, phone: user.phone, plan: user.plan });
-    });
+  // PATCH /api/auth/update-profile
+  fastify.patch('/update-profile', { preHandler: [fastify.authenticate] }, async (request, reply) => {
+    const { id } = request.user as any;
+    const { firstName, lastName } = request.body as { firstName: string; lastName: string };
+    if (!firstName?.trim()) return reply.status(400).send({ error: 'First name is required.' });
+    const [user] = await db
+      .update(users)
+      .set({ firstName: firstName.trim(), lastName: lastName?.trim() || '' })
+      .where(eq(users.id, id))
+      .returning();
+    return reply.send({ firstName: user.firstName, lastName: user.lastName });
+  });
 
-    // PATCH /api/auth/update-profile
-    fastify.patch('/update-profile', { preHandler: [fastify.authenticate] }, async (request, reply) => {
-        const { id } = request.user as any;
-        const { name } = request.body as { name: string };
-        if (!name?.trim()) return reply.status(400).send({ error: 'Name is required.' });
-        const [user] = await db.update(users).set({ name: name.trim() }).where(eq(users.id, id)).returning();
-        return reply.send({ name: user.name });
-    });
+  // PATCH /api/auth/change-password
+  fastify.patch('/change-password', { preHandler: [fastify.authenticate] }, async (request, reply) => {
+    const { id } = request.user as any;
+    const { currentPassword, newPassword } = request.body as {
+      currentPassword: string;
+      newPassword: string;
+    };
+    const [user] = await db.select().from(users).where(eq(users.id, id)).limit(1);
+    if (!user || !(await bcrypt.compare(currentPassword, user.passwordHash)))
+      return reply.status(400).send({ error: 'Current password is incorrect.' });
+    if (!newPassword || newPassword.length < 6)
+      return reply.status(400).send({ error: 'New password must be at least 6 characters.' });
+    const passwordHash = await bcrypt.hash(newPassword, 10);
+    await db.update(users).set({ passwordHash }).where(eq(users.id, id));
+    return reply.send({ success: true });
+  });
 
-    // DELETE /api/auth/delete-account
-    fastify.delete('/delete-account', { preHandler: [fastify.authenticate] }, async (request, reply) => {
-        const { id } = request.user as any;
-        await db.delete(users).where(eq(users.id, id));
-        return reply.send({ success: true });
-    });
+  // DELETE /api/auth/delete-account
+  fastify.delete('/delete-account', { preHandler: [fastify.authenticate] }, async (request, reply) => {
+    const { id } = request.user as any;
+    await db.delete(users).where(eq(users.id, id));
+    return reply.send({ success: true });
+  });
 }
