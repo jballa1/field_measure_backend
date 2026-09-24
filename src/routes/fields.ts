@@ -83,6 +83,28 @@ export default async function fieldRoutes(fastify: FastifyInstance) {
         return reply.send({ message: 'Renamed successfully.' });
     });
 
+    // PATCH /api/fields/:id/boundary — update boundary points, area, perimeter
+    fastify.patch('/:id/boundary', auth, async (request, reply) => {
+        const { id: userId } = request.user as any;
+        const { id } = request.params as { id: string };
+        const { pointsJson, areaAcres, perimeterMeters } = request.body as {
+            pointsJson: string;
+            areaAcres: number;
+            perimeterMeters: number;
+        };
+
+        if (!pointsJson) return reply.status(400).send({ error: 'pointsJson is required.' });
+
+        const [field] = await db
+            .update(fields)
+            .set({ pointsJson, areaAcres, perimeterMeters })
+            .where(and(eq(fields.id, parseInt(id)), eq(fields.userId, userId)))
+            .returning();
+
+        if (!field) return reply.status(404).send({ error: 'Field not found.' });
+        return reply.send(field);
+    });
+
     // DELETE /api/fields/:id
     fastify.delete('/:id', auth, async (request, reply) => {
         const { id: userId } = request.user as any;
