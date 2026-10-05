@@ -5,7 +5,7 @@
   "main": "index.js",
   "scripts": {
     "dev": "tsx watch src/index.ts",
-    "build": "echo 'Build complete'",
+    "build": "tsc --noEmitOnError false",
     "start": "node --import tsx/esm src/index.ts",
     "db:push": "drizzle-kit push",
     "db:studio": "drizzle-kit studio"
