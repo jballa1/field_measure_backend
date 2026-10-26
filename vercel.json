@@ -1,0 +1,13 @@
+{
+  "version": 2,
+  "buildCommand": "npm install -g tsx && echo done",
+  "outputDirectory": ".",
+  "functions": {
+    "api/index.js": {
+      "runtime": "nodejs20.x"
+    }
+  },
+  "rewrites": [
+    { "source": "/(.*)", "destination": "/api/index" }
+  ]
+}
